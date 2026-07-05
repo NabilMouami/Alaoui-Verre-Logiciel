@@ -11,13 +11,13 @@ const FactureProduit = sequelize.define(
       autoIncrement: true,
     },
     quantite: {
-      type: DataTypes.DECIMAL(10, 2),
+      type: DataTypes.INTEGER,
       allowNull: false,
       defaultValue: 1,
       validate: {
         min: {
-          args: [0.01],
-          msg: "La quantité doit être supérieure à 0",
+          args: [1],
+          msg: "La quantité doit être au moins 1",
         },
       },
     },

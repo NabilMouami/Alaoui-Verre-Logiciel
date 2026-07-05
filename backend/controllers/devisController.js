@@ -815,42 +815,66 @@ const convertDevisToInvoice = async (req, res) => {
         .json({ message: "Devis already converted to invoice" });
     }
 
-    // Skip surface check for now - can be enabled later
-    /*
-    // Check if products have enough surface available
+    // =============================================
+    // HELPERS: Surface calculation (same as frontend)
+    // =============================================
+    const roundToNextMultipleOfThree = (value) => {
+      const numValue = parseFloat(value);
+      if (isNaN(numValue) || numValue < 3) return 3;
+      if (numValue % 3 === 0) return numValue;
+      return Math.ceil(numValue / 3) * 3;
+    };
+
+    const calculateSurface = (item) => {
+      const v1 = parseFloat(item.v1) || 0;
+      const v2 = parseFloat(item.v2) || 0;
+      // Simple products (v1=1, v2=1) use quantity directly
+      if (v1 === 1 && v2 === 1) return 0;
+      const calcV1 = roundToNextMultipleOfThree(v1) / 100;
+      const calcV2 = roundToNextMultipleOfThree(v2) / 100;
+      const qty = parseFloat(item.quantite) || 0;
+      return qty * calcV1 * calcV2;
+    };
+
+    // Helper to get decrement value (surface or quantity fallback)
+    const getDecrementValue = (item) => {
+      const itemSurface = parseFloat(item.surface) || 0;
+      if (itemSurface > 0) return itemSurface;
+      const calcSurface = calculateSurface(item);
+      if (calcSurface > 0) return calcSurface;
+      return parseFloat(item.quantite) || 1;
+    };
+
+    // =============================================
+    // VÉRIFICATION DES STOCKS (SURFACES)
+    // =============================================
     console.log("🔍 Vérification des surfaces disponibles...");
+
     for (const ligne of devis.lignes) {
-      if (!ligne.produit_id) continue;
+      const produit = await Produit.findByPk(ligne.produit_id, {
+        transaction,
+      });
 
-      const produit = await Produit.findByPk(ligne.produit_id);
-      if (!produit) continue;
+      if (!produit) {
+        throw new Error(`Produit avec ID ${ligne.produit_id} non trouvé`);
+      }
 
-      // Calculate required surface in m²
-      const l1Value = parseFloat(ligne.v1) || 1;
-      const l2Value = parseFloat(ligne.v2) || 1;
-      const quantite = parseFloat(ligne.quantite) || 1;
-
-      const surfaceMM2ParUnite = Math.round(l1Value * l2Value);
-      const surfaceMM2Totale = surfaceMM2ParUnite * quantite;
-      const surfaceM2Totale = surfaceMM2Totale / 10000;
+      const qtyValue = getDecrementValue(ligne);
 
       console.log(`📐 Produit ${produit.reference}:`, {
-        L1_mm: l1Value,
-        L2_mm: l2Value,
-        quantite: quantite,
-        surface_necessaire_m2: surfaceM2Totale.toFixed(6),
+        qty_surface: qtyValue,
         surface_disponible_m2: parseFloat(produit.surface).toFixed(4),
       });
 
-      if (parseFloat(produit.surface) < surfaceM2Totale) {
-        await transaction.rollback();
-        return res.status(400).json({
-          message: `Surface insuffisante pour ${produit.designation || produit.reference}. Disponible: ${parseFloat(produit.surface).toFixed(4)} m², Nécessaire: ${surfaceM2Totale.toFixed(4)} m²`,
-        });
+      if (parseFloat(produit.surface) < qtyValue) {
+        throw new Error(
+          `Surface insuffisante pour ${produit.designation || produit.reference}. ` +
+            `Disponible: ${parseFloat(produit.surface).toFixed(4)} m², ` +
+            `Nécessaire: ${qtyValue.toFixed(4)} m²`,
+        );
       }
     }
     console.log("✅ Surfaces disponibles suffisantes");
-    */
 
     // Generate invoice number
     const prefix = "FA";
@@ -909,6 +933,45 @@ const convertDevisToInvoice = async (req, res) => {
       );
     }
 
+    // =============================================
+    // DÉCRÉMENTER LES SURFACES DES PRODUITS
+    // =============================================
+    console.log("📉 Décrémentation des surfaces (Devis → Facture)...");
+
+    for (const ligne of devis.lignes) {
+      const produit = await Produit.findByPk(ligne.produit_id, {
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+
+      if (!produit) {
+        throw new Error(
+          `Produit avec ID ${ligne.produit_id} non trouvé pour la décrémentation`,
+        );
+      }
+
+      const qtyValue = getDecrementValue(ligne);
+      const currentSurface = parseFloat(produit.surface) || 0;
+      const nouvelleSurface = Math.max(0, currentSurface - qtyValue);
+
+      await Produit.update(
+        {
+          surface: nouvelleSurface,
+        },
+        {
+          where: { id: ligne.produit_id },
+          transaction,
+          hooks: false,
+        },
+      );
+
+      console.log(
+        `✅ ${produit.reference}: ${currentSurface.toFixed(4)} - ${qtyValue.toFixed(4)} = ${nouvelleSurface.toFixed(4)} m²`,
+      );
+    }
+
+    console.log("✅ Toutes les surfaces ont été décrémentées");
+
     // Update devis to mark as converted
     devis.convertedToInvoice = true;
     devis.convertedInvoiceId = invoice.id;
@@ -921,13 +984,27 @@ const convertDevisToInvoice = async (req, res) => {
     await devis.reload();
 
     return res.json({
+      success: true,
       message: "Devis converted to invoice successfully",
       devis,
-      invoice,
+      invoice: {
+        id: invoice.id,
+        invoiceNumber: invoice.invoiceNumber,
+        customerName: invoice.customerName,
+        status: invoice.status,
+      },
     });
   } catch (error) {
     await transaction.rollback();
-    console.error("Error converting devis to invoice:", error);
+    console.error("❌ Error converting devis to invoice:", error);
+
+    if (error.message && error.message.includes("Surface insuffisante")) {
+      return res.status(400).json({
+        message: "Stock insuffisant",
+        error: error.message,
+      });
+    }
+
     return res.status(500).json({
       message: "Error converting devis to invoice",
       error: error.message,
@@ -952,6 +1029,65 @@ const convertDevisToBonLivraison = async (req, res) => {
         .status(400)
         .json({ message: "Devis already converted to bon livraison" });
     }
+
+    // =============================================
+    // HELPERS: Surface calculation (same as frontend)
+    // =============================================
+    const roundToNextMultipleOfThree = (value) => {
+      const numValue = parseFloat(value);
+      if (isNaN(numValue) || numValue < 3) return 3;
+      if (numValue % 3 === 0) return numValue;
+      return Math.ceil(numValue / 3) * 3;
+    };
+
+    const calculateSurface = (item) => {
+      const v1 = parseFloat(item.v1) || 0;
+      const v2 = parseFloat(item.v2) || 0;
+      // Simple products (v1=1, v2=1) use quantity directly
+      if (v1 === 1 && v2 === 1) return 0;
+      const calcV1 = roundToNextMultipleOfThree(v1) / 100;
+      const calcV2 = roundToNextMultipleOfThree(v2) / 100;
+      const qty = parseFloat(item.quantite) || 0;
+      return qty * calcV1 * calcV2;
+    };
+
+    // Helper to get decrement value (surface or quantity fallback)
+    const getDecrementValue = (item) => {
+      const calcSurface = calculateSurface(item);
+      if (calcSurface > 0) return calcSurface;
+      return parseFloat(item.quantite) || 1;
+    };
+
+    // =============================================
+    // VÉRIFICATION DES STOCKS (SURFACES)
+    // =============================================
+    console.log("🔍 Vérification des surfaces disponibles...");
+
+    for (const ligne of devis.lignes) {
+      const produit = await Produit.findByPk(ligne.produit_id, {
+        transaction,
+      });
+
+      if (!produit) {
+        throw new Error(`Produit avec ID ${ligne.produit_id} non trouvé`);
+      }
+
+      const qtyValue = getDecrementValue(ligne);
+
+      console.log(`📐 Produit ${produit.reference}:`, {
+        qty_surface: qtyValue,
+        surface_disponible_m2: parseFloat(produit.surface).toFixed(4),
+      });
+
+      if (parseFloat(produit.surface) < qtyValue) {
+        throw new Error(
+          `Surface insuffisante pour ${produit.designation || produit.reference}. ` +
+            `Disponible: ${parseFloat(produit.surface).toFixed(4)} m², ` +
+            `Nécessaire: ${qtyValue.toFixed(4)} m²`,
+        );
+      }
+    }
+    console.log("✅ Surfaces disponibles suffisantes");
 
     // Generate bon livraison number
     const prefix = "BL";
@@ -1010,6 +1146,45 @@ const convertDevisToBonLivraison = async (req, res) => {
       );
     }
 
+    // =============================================
+    // DÉCRÉMENTER LES SURFACES DES PRODUITS
+    // =============================================
+    console.log("📉 Décrémentation des surfaces (Devis → Bon Livraison)...");
+
+    for (const ligne of devis.lignes) {
+      const produit = await Produit.findByPk(ligne.produit_id, {
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+
+      if (!produit) {
+        throw new Error(
+          `Produit avec ID ${ligne.produit_id} non trouvé pour la décrémentation`,
+        );
+      }
+
+      const qtyValue = getDecrementValue(ligne);
+      const currentSurface = parseFloat(produit.surface) || 0;
+      const nouvelleSurface = Math.max(0, currentSurface - qtyValue);
+
+      await Produit.update(
+        {
+          surface: nouvelleSurface,
+        },
+        {
+          where: { id: ligne.produit_id },
+          transaction,
+          hooks: false,
+        },
+      );
+
+      console.log(
+        `✅ ${produit.reference}: ${currentSurface.toFixed(4)} - ${qtyValue.toFixed(4)} = ${nouvelleSurface.toFixed(4)} m²`,
+      );
+    }
+
+    console.log("✅ Toutes les surfaces ont été décrémentées");
+
     // Update devis to mark as converted
     devis.convertedToBonLivraison = true;
     devis.convertedBonLivraisonId = bonLivraison.id;
@@ -1022,13 +1197,27 @@ const convertDevisToBonLivraison = async (req, res) => {
     await devis.reload();
 
     return res.json({
+      success: true,
       message: "Devis converted to bon livraison successfully",
       devis,
-      bonLivraison,
+      bonLivraison: {
+        id: bonLivraison.id,
+        deliveryNumber: bonLivraison.deliveryNumber,
+        customerName: bonLivraison.customerName,
+        status: bonLivraison.status,
+      },
     });
   } catch (error) {
     await transaction.rollback();
-    console.error("Error converting devis to bon livraison:", error);
+    console.error("❌ Error converting devis to bon livraison:", error);
+
+    if (error.message && error.message.includes("Surface insuffisante")) {
+      return res.status(400).json({
+        message: "Stock insuffisant",
+        error: error.message,
+      });
+    }
+
     return res.status(500).json({
       message: "Error converting devis to bon livraison",
       error: error.message,

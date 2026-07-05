@@ -17,6 +17,7 @@ const Facture = require("./Facture");
 const FactureProduit = require("./FactureProduit");
 const FactureAchat = require("./FactureAchat");
 const FactureAchatProduit = require("./FactureAchatProduit");
+
 // ============================================
 // USER ASSOCIATIONS
 // ============================================
@@ -148,28 +149,17 @@ Advancement.belongsTo(BonLivraison, {
   onUpdate: "CASCADE",
 });
 
-// Many-to-Many relationship between BonLivraison and Produit
-BonLivraison.belongsToMany(Produit, {
-  through: BonLivraisonProduit,
+// ============================================
+// BON LIVRAISON - PRODUIT (LIGNES DE DETAIL)
+// ============================================
+// NOTE: belongsToMany removed to allow duplicate produit_id in same bon
+
+BonLivraison.hasMany(BonLivraisonProduit, {
   foreignKey: "bon_livraison_id",
-  otherKey: "produit_id",
-  as: "produits",
+  as: "lignes",
   onDelete: "CASCADE",
-  onUpdate: "CASCADE",
-  uniqueKey: false,
 });
 
-Produit.belongsToMany(BonLivraison, {
-  through: BonLivraisonProduit,
-  foreignKey: "produit_id",
-  otherKey: "bon_livraison_id",
-  as: "bonLivraisons",
-  onDelete: "CASCADE",
-  onUpdate: "CASCADE",
-  uniqueKey: false,
-});
-
-// Direct relationships for BonLivraisonProduit
 BonLivraisonProduit.belongsTo(BonLivraison, {
   foreignKey: "bon_livraison_id",
   as: "bonLivraison",
@@ -178,12 +168,6 @@ BonLivraisonProduit.belongsTo(BonLivraison, {
 BonLivraisonProduit.belongsTo(Produit, {
   foreignKey: "produit_id",
   as: "produit",
-});
-
-BonLivraison.hasMany(BonLivraisonProduit, {
-  foreignKey: "bon_livraison_id",
-  as: "lignes",
-  onDelete: "CASCADE",
 });
 
 Produit.hasMany(BonLivraisonProduit, {
@@ -207,7 +191,7 @@ Devis.belongsTo(Client, {
   onUpdate: "CASCADE",
 });
 
-// Devis ↔ DevisItem
+// Devis <-> DevisItem
 Devis.hasMany(DevisItem, {
   foreignKey: "devis_id",
   as: "lignes",
@@ -220,7 +204,7 @@ DevisItem.belongsTo(Devis, {
   as: "devis",
 });
 
-// DevisItem ↔ Produit
+// DevisItem <-> Produit
 DevisItem.belongsTo(Produit, {
   foreignKey: "produit_id",
   as: "produit",
@@ -273,31 +257,17 @@ Facture.hasMany(Advancement, {
   onUpdate: "CASCADE",
 });
 
-// Note: You'll need to update the Advancement model to include facture_id
-// We'll modify Advancement model later
+// ============================================
+// FACTURE - PRODUIT (LIGNES DE DETAIL)
+// ============================================
+// NOTE: belongsToMany removed to allow duplicate produit_id in same facture
 
-// Many-to-Many relationship between Facture and Produit
-Facture.belongsToMany(Produit, {
-  through: FactureProduit,
+Facture.hasMany(FactureProduit, {
   foreignKey: "facture_id",
-  otherKey: "produit_id",
-  as: "produits",
+  as: "lignes",
   onDelete: "CASCADE",
-  onUpdate: "CASCADE",
-  uniqueKey: false,
 });
 
-Produit.belongsToMany(Facture, {
-  through: FactureProduit,
-  foreignKey: "produit_id",
-  otherKey: "facture_id",
-  as: "factures",
-  onDelete: "CASCADE",
-  onUpdate: "CASCADE",
-  uniqueKey: false,
-});
-
-// Direct relationships for FactureProduit
 FactureProduit.belongsTo(Facture, {
   foreignKey: "facture_id",
   as: "facture",
@@ -310,17 +280,16 @@ FactureProduit.belongsTo(Produit, {
   onDelete: "CASCADE",
 });
 
-Facture.hasMany(FactureProduit, {
-  foreignKey: "facture_id",
-  as: "lignes",
-  onDelete: "CASCADE",
-});
-
 Produit.hasMany(FactureProduit, {
   foreignKey: "produit_id",
   as: "factureItems",
   onDelete: "CASCADE",
 });
+
+// ============================================
+// FACTURE ACHAT - PRODUIT (LIGNES DE DETAIL)
+// ============================================
+// NOTE: belongsToMany removed to allow duplicate produit_id in same facture achat
 
 Fornisseur.hasMany(FactureAchat, {
   foreignKey: "fornisseurId",
@@ -350,28 +319,12 @@ FactureAchat.belongsTo(User, {
   onUpdate: "CASCADE",
 });
 
-// Many-to-Many relationship between FactureAchat and Produit
-FactureAchat.belongsToMany(Produit, {
-  through: FactureAchatProduit,
+FactureAchat.hasMany(FactureAchatProduit, {
   foreignKey: "facture_achat_id",
-  otherKey: "produit_id",
-  as: "produitsAchat",
+  as: "lignes",
   onDelete: "CASCADE",
-  onUpdate: "CASCADE",
-  uniqueKey: false,
 });
 
-Produit.belongsToMany(FactureAchat, {
-  through: FactureAchatProduit,
-  foreignKey: "produit_id",
-  otherKey: "facture_achat_id",
-  as: "facturesAchat",
-  onDelete: "CASCADE",
-  onUpdate: "CASCADE",
-  uniqueKey: false,
-});
-
-// Direct relationships for FactureAchatProduit
 FactureAchatProduit.belongsTo(FactureAchat, {
   foreignKey: "facture_achat_id",
   as: "factureAchat",
@@ -381,12 +334,6 @@ FactureAchatProduit.belongsTo(FactureAchat, {
 FactureAchatProduit.belongsTo(Produit, {
   foreignKey: "produit_id",
   as: "produit",
-  onDelete: "CASCADE",
-});
-
-FactureAchat.hasMany(FactureAchatProduit, {
-  foreignKey: "facture_achat_id",
-  as: "lignes",
   onDelete: "CASCADE",
 });
 

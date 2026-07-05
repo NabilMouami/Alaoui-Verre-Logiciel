@@ -90,6 +90,36 @@ const createBonLivraison = async (req, res) => {
 
     console.log("✅ All validations passed");
 
+    // =============================================
+    // VÉRIFICATION DES STOCKS (SURFACES)
+    // =============================================
+    console.log("🔍 Vérification des surfaces disponibles...");
+    for (const item of items) {
+      const produit = await Produit.findByPk(item.productId);
+
+      if (!produit) {
+        throw new Error(`Produit avec ID ${item.productId} non trouvé`);
+      }
+
+      // La qty représente directement la surface en m² à diminuer
+      const qtyValue =
+        parseFloat(item.quantity) || parseFloat(item.surface) || 1;
+
+      console.log(`📐 Produit ${produit.reference}:`, {
+        qty_surface: qtyValue,
+        surface_disponible_m2: parseFloat(produit.surface).toFixed(4),
+      });
+
+      if (parseFloat(produit.surface) < qtyValue) {
+        throw new Error(
+          `Surface insuffisante pour ${produit.designation || produit.reference}. ` +
+            `Disponible: ${parseFloat(produit.surface).toFixed(4)} m², ` +
+            `Nécessaire: ${qtyValue.toFixed(4)} m²`,
+        );
+      }
+    }
+    console.log("✅ Surfaces disponibles suffisantes");
+
     // Generate delivery number
     console.log("🔢 Generating delivery number...");
     const deliveryNumber = await generateDeliveryNumber();
@@ -216,6 +246,54 @@ const createBonLivraison = async (req, res) => {
     console.log(
       `✅ Created ${bonLivraisonItems.length} BonLivraisonProduit items`,
     );
+
+    // =============================================
+    // DÉCRÉMENTER LA SURFACE DES PRODUITS DIRECTEMENT PAR QTY
+    // =============================================
+    console.log("📉 Décrémentation des surfaces...");
+
+    for (const item of items) {
+      const produit = await Produit.findByPk(item.productId, {
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+
+      if (!produit) {
+        throw new Error(
+          `Produit avec ID ${item.productId} non trouvé pour la décrémentation`,
+        );
+      }
+
+      // La qty représente directement la surface en m² à diminuer
+      const qtyValue =
+        parseFloat(item.surface) || parseFloat(item.quantity) || 1;
+      const surfaceActuelle = parseFloat(produit.surface) || 0;
+      const nouvelleSurface = Math.max(0, surfaceActuelle - qtyValue);
+
+      console.log(`📊 Produit ${produit.reference}:`, {
+        surface_actuelle_m2: surfaceActuelle.toFixed(4),
+        qty_surface_decremente: qtyValue.toFixed(4),
+        nouvelle_surface_m2: nouvelleSurface.toFixed(4),
+      });
+
+      // Mise à jour avec hooks désactivés
+      await Produit.update(
+        {
+          surface: nouvelleSurface,
+        },
+        {
+          where: { id: item.productId },
+          transaction,
+          hooks: false,
+        },
+      );
+
+      console.log(
+        `✅ Produit ${produit.reference}: ${surfaceActuelle.toFixed(4)} - ${qtyValue.toFixed(4)} = ${nouvelleSurface.toFixed(4)} m²`,
+      );
+    }
+
+    console.log("✅ Toutes les surfaces ont été décrémentées");
 
     // Create advancements if any
     if (
@@ -621,6 +699,36 @@ const updateBonLivraison = async (req, res) => {
 
     console.log("✅ Basic validations passed");
 
+    // =============================================
+    // HELPERS: Surface calculation (same as frontend)
+    // =============================================
+    const roundToNextMultipleOfThree = (value) => {
+      const numValue = parseFloat(value);
+      if (isNaN(numValue) || numValue < 3) return 3;
+      if (numValue % 3 === 0) return numValue;
+      return Math.ceil(numValue / 3) * 3;
+    };
+
+    const calculateSurface = (item) => {
+      const v1 = parseFloat(item.v1) || 0;
+      const v2 = parseFloat(item.v2) || 0;
+      // Simple products (v1=1, v2=1) use quantity directly
+      if (v1 === 1 && v2 === 1) return 0;
+      const calcV1 = roundToNextMultipleOfThree(v1) / 100;
+      const calcV2 = roundToNextMultipleOfThree(v2) / 100;
+      const qty = parseFloat(item.quantite) || 0;
+      return qty * calcV1 * calcV2;
+    };
+
+    // Helper to get decrement value (surface or quantity fallback)
+    const getDecrementValue = (item) => {
+      const itemSurface = parseFloat(item.surface) || 0;
+      if (itemSurface > 0) return itemSurface;
+      const calcSurface = calculateSurface(item);
+      if (calcSurface > 0) return calcSurface;
+      return parseFloat(item.quantite) || 1;
+    };
+
     let preparedItems = [];
     let calculatedSubTotal = subTotal || bonLivraison.subTotal || 0;
 
@@ -647,6 +755,7 @@ const updateBonLivraison = async (req, res) => {
           v3: item.v3,
           prix_unitaire: item.prix_unitaire,
           designation: item.designation,
+          surface: item.surface,
         });
 
         return {
@@ -664,6 +773,7 @@ const updateBonLivraison = async (req, res) => {
             parseFloat(item.quantite) ||
             0,
           designation: item.designation || null,
+          surface: parseFloat(item.surface) || 0, // From frontend
         };
       });
 
@@ -713,6 +823,205 @@ const updateBonLivraison = async (req, res) => {
       advancement: totalAdvancement,
       remainingAmount: calculatedRemainingAmount,
     });
+
+    // =============================================
+    // ✅ NEW: STATUS "ANNULÉE" → RESTAURER TOUTES LES SURFACES
+    // =============================================
+    const isStatusChangingToAnnulee =
+      status === "annulée" && bonLivraison.status !== "annulée";
+
+    if (isStatusChangingToAnnulee) {
+      console.log(
+        "🔄 Changement de statut vers ANNULÉE - Restauration des surfaces...",
+      );
+
+      for (const oldItem of bonLivraison.lignes) {
+        const produit = await Produit.findByPk(oldItem.produit_id, {
+          transaction,
+          lock: transaction.LOCK.UPDATE,
+        });
+
+        if (!produit) {
+          console.log(`⚠️ Produit ID ${oldItem.produit_id} non trouvé, skip`);
+          continue;
+        }
+
+        // Calculate the surface that was originally decremented
+        const oldQty = parseFloat(oldItem.quantite) || 0;
+        const oldV1 = parseFloat(oldItem.v1) || 1;
+        const oldV2 = parseFloat(oldItem.v2) || 1;
+        let restoredSurfaceValue = 0;
+
+        if (oldV1 === 1 && oldV2 === 1) {
+          restoredSurfaceValue = oldQty;
+        } else {
+          const calcV1 = roundToNextMultipleOfThree(oldV1) / 100;
+          const calcV2 = roundToNextMultipleOfThree(oldV2) / 100;
+          restoredSurfaceValue = oldQty * calcV1 * calcV2;
+        }
+
+        const currentSurface = parseFloat(produit.surface) || 0;
+        const newSurface = currentSurface + restoredSurfaceValue;
+
+        await Produit.update(
+          { surface: newSurface },
+          {
+            where: { id: oldItem.produit_id },
+            transaction,
+            hooks: false,
+          },
+        );
+
+        console.log(
+          `✅ ANNULÉE - Restored ${restoredSurfaceValue.toFixed(4)} m² to ${produit.reference} (${currentSurface.toFixed(4)} → ${newSurface.toFixed(4)})`,
+        );
+      }
+
+      console.log("✅ Surfaces restaurées suite à l'annulation");
+    }
+
+    // =============================================
+    // RESTAURER LES ANCIENNES SURFACES (si articles modifiés ET pas annulée)
+    // =============================================
+    if (
+      items &&
+      Array.isArray(items) &&
+      items.length > 0 &&
+      !isStatusChangingToAnnulee
+    ) {
+      console.log("📈 Restauration des anciennes surfaces...");
+      for (const oldItem of bonLivraison.lignes) {
+        const produit = await Produit.findByPk(oldItem.produit_id, {
+          transaction,
+          lock: transaction.LOCK.UPDATE,
+        });
+
+        if (!produit) continue;
+
+        const oldQty = parseFloat(oldItem.quantite) || 0;
+        const oldV1 = parseFloat(oldItem.v1) || 1;
+        const oldV2 = parseFloat(oldItem.v2) || 1;
+        let oldSurface = 0;
+
+        if (oldV1 === 1 && oldV2 === 1) {
+          oldSurface = oldQty;
+        } else {
+          const calcV1 = roundToNextMultipleOfThree(oldV1) / 100;
+          const calcV2 = roundToNextMultipleOfThree(oldV2) / 100;
+          oldSurface = oldQty * calcV1 * calcV2;
+        }
+
+        const currentSurface = parseFloat(produit.surface) || 0;
+        const restoredSurface = currentSurface + oldSurface;
+
+        await Produit.update(
+          { surface: restoredSurface },
+          {
+            where: { id: oldItem.produit_id },
+            transaction,
+            hooks: false,
+          },
+        );
+
+        console.log(
+          `✅ Restored ${oldSurface.toFixed(4)} m² to ${produit.reference} (${currentSurface.toFixed(4)} → ${restoredSurface.toFixed(4)})`,
+        );
+      }
+      console.log("✅ Anciennes surfaces restaurées");
+    }
+
+    // =============================================
+    // VÉRIFICATION DES STOCKS (SURFACES) — NOUVEAUX ARTICLES
+    // =============================================
+    if (
+      items &&
+      Array.isArray(items) &&
+      items.length > 0 &&
+      !isStatusChangingToAnnulee
+    ) {
+      console.log("🔍 Vérification des nouvelles surfaces disponibles...");
+      for (const item of preparedItems) {
+        const produit = await Produit.findByPk(item.produit_id);
+        if (!produit) {
+          throw new Error(`Produit avec ID ${item.produit_id} non trouvé`);
+        }
+
+        const qtyValue = getDecrementValue(item);
+
+        console.log(`📐 Produit ${produit.reference}:`, {
+          qty_surface: qtyValue,
+          surface_disponible_m2: parseFloat(produit.surface).toFixed(4),
+        });
+
+        if (parseFloat(produit.surface) < qtyValue) {
+          throw new Error(
+            `Surface insuffisante pour ${produit.designation || produit.reference}. ` +
+              `Disponible: ${parseFloat(produit.surface).toFixed(4)} m², ` +
+              `Nécessaire: ${qtyValue.toFixed(4)} m²`,
+          );
+        }
+      }
+      console.log("✅ Surfaces disponibles suffisantes");
+    }
+
+    // =============================================
+    // STATUS CHANGE → Décrémenter stock si pas encore fait
+    // (si pas d'articles envoyés mais changement de statut brouillon → confirmé)
+    // =============================================
+    const isStatusChangingToConfirmed =
+      bonLivraison.status === "brouillon" &&
+      status &&
+      status !== "brouillon" &&
+      status !== "annulée" &&
+      (!items || items.length === 0);
+
+    if (isStatusChangingToConfirmed) {
+      console.log("📉 Décrémentation des surfaces (changement de statut)...");
+      for (const oldItem of bonLivraison.lignes) {
+        const produit = await Produit.findByPk(oldItem.produit_id, {
+          transaction,
+          lock: transaction.LOCK.UPDATE,
+        });
+        if (!produit) continue;
+
+        const oldQty = parseFloat(oldItem.quantite) || 0;
+        const oldV1 = parseFloat(oldItem.v1) || 1;
+        const oldV2 = parseFloat(oldItem.v2) || 1;
+        let decrementValue = 0;
+
+        if (oldV1 === 1 && oldV2 === 1) {
+          decrementValue = oldQty;
+        } else {
+          const calcV1 = roundToNextMultipleOfThree(oldV1) / 100;
+          const calcV2 = roundToNextMultipleOfThree(oldV2) / 100;
+          decrementValue = oldQty * calcV1 * calcV2;
+        }
+
+        const currentSurface = parseFloat(produit.surface) || 0;
+        if (currentSurface < decrementValue) {
+          throw new Error(
+            `Surface insuffisante pour ${produit.designation || produit.reference}. ` +
+              `Disponible: ${currentSurface.toFixed(4)} m², ` +
+              `Nécessaire: ${decrementValue.toFixed(4)} m²`,
+          );
+        }
+
+        const newSurface = Math.max(0, currentSurface - decrementValue);
+        await Produit.update(
+          { surface: newSurface },
+          {
+            where: { id: oldItem.produit_id },
+            transaction,
+            hooks: false,
+          },
+        );
+
+        console.log(
+          `✅ ${produit.reference}: ${currentSurface.toFixed(4)} - ${decrementValue.toFixed(4)} = ${newSurface.toFixed(4)} m²`,
+        );
+      }
+      console.log("✅ Surfaces décrémentées (changement de statut)");
+    }
 
     console.log("🔄 Updating BonLivraison...");
 
@@ -787,7 +1096,12 @@ const updateBonLivraison = async (req, res) => {
     await bonLivraison.save({ transaction });
     console.log("✅ BonLivraison updated! ID:", bonLivraison.id);
 
-    if (items && Array.isArray(items) && items.length > 0) {
+    if (
+      items &&
+      Array.isArray(items) &&
+      items.length > 0 &&
+      !isStatusChangingToAnnulee
+    ) {
       console.log("📝 Updating BonLivraisonProduit items...");
 
       const receivedIds = items
@@ -833,6 +1147,52 @@ const updateBonLivraison = async (req, res) => {
       }
     } else {
       console.log("ℹ️ No items to update, keeping existing items");
+    }
+
+    // =============================================
+    // DÉCRÉMENTER LES NOUVELLES SURFACES (après mise à jour DB)
+    // =============================================
+    if (
+      items &&
+      Array.isArray(items) &&
+      items.length > 0 &&
+      !isStatusChangingToAnnulee
+    ) {
+      console.log("📉 Décrémentation des nouvelles surfaces...");
+
+      for (const item of preparedItems) {
+        const produit = await Produit.findByPk(item.produit_id, {
+          transaction,
+          lock: transaction.LOCK.UPDATE,
+        });
+
+        if (!produit) {
+          throw new Error(
+            `Produit avec ID ${item.produit_id} non trouvé pour la décrémentation`,
+          );
+        }
+
+        const qtyValue = getDecrementValue(item);
+        const currentSurface = parseFloat(produit.surface) || 0;
+        const nouvelleSurface = Math.max(0, currentSurface - qtyValue);
+
+        await Produit.update(
+          {
+            surface: nouvelleSurface,
+          },
+          {
+            where: { id: item.produit_id },
+            transaction,
+            hooks: false,
+          },
+        );
+
+        console.log(
+          `✅ ${produit.reference}: ${currentSurface.toFixed(4)} - ${qtyValue.toFixed(4)} = ${nouvelleSurface.toFixed(4)} m²`,
+        );
+      }
+
+      console.log("✅ Toutes les nouvelles surfaces ont été décrémentées");
     }
 
     console.log("💳 Updating advancements...");
@@ -953,16 +1313,113 @@ const updateBonLivraison = async (req, res) => {
 };
 
 const deleteBonLivraison = async (req, res) => {
+  const transaction = await BonLivraison.sequelize.transaction();
+
   try {
-    const bonLivraison = await BonLivraison.findByPk(req.params.id);
+    const bonLivraison = await BonLivraison.findByPk(req.params.id, {
+      include: [
+        {
+          model: BonLivraisonProduit,
+          as: "lignes",
+        },
+      ],
+      transaction,
+    });
+
     if (!bonLivraison) {
+      await transaction.rollback();
       return res.status(404).json({ message: "Delivery note not found" });
     }
 
-    await bonLivraison.destroy();
-    return res.json({ message: "Delivery note deleted successfully" });
+    // =============================================
+    // HELPERS: Same surface calculation as frontend
+    // =============================================
+    const roundToNextMultipleOfThree = (value) => {
+      const numValue = parseFloat(value);
+      if (isNaN(numValue) || numValue < 3) return 3;
+      if (numValue % 3 === 0) return numValue;
+      return Math.ceil(numValue / 3) * 3;
+    };
+
+    const calculateSurface = (item) => {
+      const v1 = parseFloat(item.v1) || 0;
+      const v2 = parseFloat(item.v2) || 0;
+      // Simple products (v1=1, v2=1) use quantity directly
+      if (v1 === 1 && v2 === 1) return 0;
+      const calcV1 = roundToNextMultipleOfThree(v1) / 100;
+      const calcV2 = roundToNextMultipleOfThree(v2) / 100;
+      const qty = parseFloat(item.quantite) || 0;
+      return qty * calcV1 * calcV2;
+    };
+
+    // Helper to get the value that was decremented
+    const getDecrementValue = (item) => {
+      const itemSurface = parseFloat(item.surface) || 0;
+      if (itemSurface > 0) return itemSurface;
+      const calcSurface = calculateSurface(item);
+      if (calcSurface > 0) return calcSurface;
+      return parseFloat(item.quantite) || 1;
+    };
+
+    // =============================================
+    // RESTAURER LES SURFACES DES PRODUITS
+    // =============================================
+    console.log("📈 Restauration des surfaces avant suppression...");
+
+    for (const item of bonLivraison.lignes) {
+      const produit = await Produit.findByPk(item.produit_id, {
+        transaction,
+        lock: transaction.LOCK.UPDATE,
+      });
+
+      if (!produit) {
+        console.log(`⚠️ Produit ID ${item.produit_id} non trouvé, skip`);
+        continue;
+      }
+
+      const qtyValue = getDecrementValue(item);
+      const currentSurface = parseFloat(produit.surface) || 0;
+      const restoredSurface = currentSurface + qtyValue;
+
+      await Produit.update(
+        { surface: restoredSurface },
+        {
+          where: { id: item.produit_id },
+          transaction,
+          hooks: false,
+        },
+      );
+
+      console.log(
+        `✅ ${produit.reference}: ${currentSurface.toFixed(4)} + ${qtyValue.toFixed(4)} = ${restoredSurface.toFixed(4)} m²`,
+      );
+    }
+
+    console.log("✅ Surfaces restaurées");
+
+    // =============================================
+    // SUPPRIMER LE BON LIVRAISON (CASCADE supprime lignes & advancements)
+    // =============================================
+    await bonLivraison.destroy({ transaction });
+
+    await transaction.commit();
+
+    return res.json({
+      success: true,
+      message: "Delivery note deleted successfully",
+    });
   } catch (err) {
-    console.error("Delete delivery note error:", err);
+    await transaction.rollback();
+
+    console.error("❌ DELETE BON LIVRAISON - ERROR:", err);
+
+    if (err.name === "SequelizeForeignKeyConstraintError") {
+      return res.status(400).json({
+        message: "Cannot delete delivery note",
+        error: "It is referenced by other records (facture, etc.)",
+      });
+    }
+
     return res.status(500).json({
       message: "Server error",
       error: err.message,
